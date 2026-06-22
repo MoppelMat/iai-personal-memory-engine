@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
@@ -18,6 +19,29 @@ if TYPE_CHECKING:
 
 
 SIGMA_N_FLOOR: int = 200
+
+# Defensive upper bound on graph size for the sigma (small-worldness) audit.
+# fast_sigma() runs average_clustering + all-pairs-shortest-path on the largest
+# component AND on n_random reference graphs of the same order; that cost is
+# roughly O(n_random * (V*E + V^2)) and is unbounded as the live graph grows.
+# Above the cap we return None: the regime degrades cleanly to "insufficient_data"
+# (sigma None is already handled everywhere) and the tick stays bounded -- the
+# watchdog does NOT kill on CPU, so an unbounded sigma compute would spin a core
+# uncontained. The default is far above the current live store (~4k nodes) so it
+# never trips today; both bounds are env-overridable.
+SIGMA_N_CEIL: int = 20000
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
 
 SIGMA_MID_LIFE_THRESHOLD: int = 500
 
@@ -194,7 +218,19 @@ def fast_sigma(
 
 
 def compute_sigma(graph: "MemoryGraph", *, seed: int = 42) -> Optional[float]:
-    if graph.node_count() < SIGMA_N_FLOOR:
+    n = graph.node_count()
+    floor = _env_int("IAI_MCP_SIGMA_N_FLOOR", SIGMA_N_FLOOR)
+    ceil = _env_int("IAI_MCP_SIGMA_N_CEIL", SIGMA_N_CEIL)
+    if n < floor:
+        return None
+    if n > ceil:
+        # Above the defensive cap: skip the (unbounded) small-worldness compute
+        # so a single tick can never spin a core for minutes on a pathologically
+        # large graph. Reported downstream as "insufficient_data".
+        logger.warning(
+            "sigma_skipped_above_ceiling",
+            extra={"node_count": int(n), "ceil": int(ceil)},
+        )
         return None
     sigma_val, *_ = fast_sigma(graph, seed=seed)
     if isinstance(sigma_val, float) and math.isnan(sigma_val):
@@ -214,7 +250,16 @@ def classify_regime(N: int, sigma: Optional[float]) -> str:
     return "healthy"
 
 
-def compute_topology_snapshot(graph) -> dict:
+def compute_topology_snapshot(graph, *, assignment=None) -> dict:
+    """Topology metrics for `graph`.
+
+    Computes community detection in-process by default. The request-synchronous
+    callers (the `topology` health surface, used by `iai status` and the
+    topology tool, plus operator analytics) rely on this near-instant path and
+    pass no `assignment`. Background callers that have already computed the
+    community assignment off the interactive path may pass it in to skip the
+    in-process recompute.
+    """
     from iai_mcp.graph import MemoryGraph
 
     if not isinstance(graph, MemoryGraph):
@@ -271,9 +316,10 @@ def compute_topology_snapshot(graph) -> dict:
         from iai_mcp.richclub import rich_club_nodes
 
         try:
-            assignment = detect_communities(
-                graph, prior=None, prior_mode="seeded"
-            )
+            if assignment is None:
+                assignment = detect_communities(
+                    graph, prior=None, prior_mode="seeded"
+                )
             community_count = int(len(assignment.community_centroids))
         except (RuntimeError, ValueError, TypeError):
             community_count = 0
@@ -318,12 +364,29 @@ def compute_and_emit(store: "MemoryStore") -> dict:
     from iai_mcp import retrieve
 
     graph_bundle = retrieve.build_runtime_graph(store)
+    assignment = None
     if isinstance(graph_bundle, tuple):
         graph = graph_bundle[0]
+        if len(graph_bundle) > 1:
+            assignment = graph_bundle[1]
     else:
         graph = graph_bundle
 
-    snap = compute_topology_snapshot(graph)
+    # This is the background topology pass (hourly audit + offline sleep step),
+    # off the interactive path. The graph build already detects communities in a
+    # short-lived child, so the daemon does not accumulate JIT compilation
+    # arenas; reuse that assignment. Only when the build did not surface one
+    # (degraded bundle) is detection run in a child here, with the same spawn
+    # failure degrading to the in-process recompute inside the snapshot.
+    if assignment is None:
+        try:
+            from iai_mcp.runtime_graph_cache import compute_assignment_in_child
+
+            assignment = compute_assignment_in_child(graph, prior_mode="seeded")
+        except (RuntimeError, ValueError, TypeError, OSError, AttributeError):
+            assignment = None
+
+    snap = compute_topology_snapshot(graph, assignment=assignment)
     regime = snap.get("regime", "insufficient_data")
 
     base_data = {
